@@ -267,6 +267,16 @@ app.post('/api/characters', requireAuth, async (req, res) => {
 
 /* ════ HEALTH & ROOT ════ */
 app.get('/',       (req, res) => res.json({ status:'ok' }));
+app.get('/api/test/:name', async (req, res) => {
+  try {
+    const r = await fetch(`https://api.tibiadata.com/v4/character/${encodeURIComponent(req.params.name)}`);
+    const text = await r.text();
+    res.json({ status: r.status, body: JSON.parse(text) });
+  } catch(e) {
+    res.json({ error: e.message });
+  }
+});
+
 app.get('/health', (req, res) => res.json({
   status:'ok', service:'Tibia Market API', version:'1.0.0',
   port:PORT, db: process.env.DATABASE_URL?'configurada':'falta'
