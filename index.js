@@ -34,14 +34,13 @@ function normalizeVoc(v) {
 }
 async function getCharacter(name) {
   try {
-    const r = await fetch(`https://api.tibiadata.com/v4/character/${encodeURIComponent(name)}`, { timeout: 10000 });
-    if (r.status === 404) return null;
+    const r = await fetch(`https://api.tibiadata.com/v4/character/${encodeURIComponent(name)}`);
     if (!r.ok) return null;
     const d = await r.json();
     const c = d?.character?.character;
     if (!c?.name) return null;
     return { name: c.name, world: c.world, vocation: normalizeVoc(c.vocation), level: c.level || 1, guild: c.guild?.name || null };
-  } catch { return null; }
+  } catch(e) { console.error('TibiaData error:', e.message); return null; }
 }
 
 /* ── Auth middleware ── */
@@ -51,7 +50,7 @@ async function requireAuth(req, res, next) {
     if (!h?.startsWith('Bearer ')) return res.status(401).json({ error: 'Token requerido' });
     const payload = jwt.verify(h.split(' ')[1], process.env.JWT_SECRET);
     const { rows } = await query(
-      `SELECT s.user_id,s.character_id,c.name AS cn,c.world,c.vocation,c.level,u.reputation,u.total_trades
+      `SELECT s.user_id,s.character_id,c.name AS cn,c.world,c.vocation,c.level,u.reputation
        FROM sessions s JOIN characters c ON c.id=s.character_id JOIN users u ON u.id=s.user_id
        WHERE s.token_hash=$1 AND s.expires_at>NOW() AND u.is_active=TRUE`, [payload.tokenHash]
     );
@@ -65,24 +64,39 @@ async function requireAuth(req, res, next) {
 
 /* ── Express setup ── */
 app.use(helmet());
-app.use(cors({ origin: process.env.FRONTEND_URL || '*', credentials: true }));
+app.use(cors({ origin: true, credentials: true }));
 app.use(express.json({ limit: '1mb' }));
 app.use(morgan('combined'));
-const limiter     = rateLimit({ windowMs: 15*60*1000, max: 100 });
-const authLimiter = rateLimit({ windowMs: 15*60*1000, max: 15 });
+const limiter = rateLimit({ windowMs: 15*60*1000, max: 200 });
 app.use(limiter);
 
-/* ════ RUTAS AUTH ════ */
-app.post('/api/auth/verify', authLimiter, async (req, res) => {
-  const name = (req.body.characterName || '').trim();
-  if (!name) return res.status(400).json({ error: 'Falta characterName' });
-  const char = await getCharacter(name);
-  if (!char) return res.status(404).json({ error: 'Personaje no encontrado en Tibia' });
-  const { rows } = await query('SELECT user_id FROM characters WHERE name_lower=$1', [char.name.toLowerCase()]);
-  res.json({ character: char, hasAccount: rows.length > 0 });
+/* ════ TEST ENDPOINT ════ */
+app.get('/api/test/:name', async (req, res) => {
+  try {
+    const char = await getCharacter(req.params.name);
+    res.json({ found: !!char, character: char });
+  } catch(e) { res.json({ error: e.message }); }
 });
 
-app.post('/api/auth/register', authLimiter, async (req, res) => {
+/* ════ AUTH ════ */
+app.post('/api/auth/verify', async (req, res) => {
+  try {
+    const name = (req.body.characterName || '').trim();
+    if (!name) return res.status(400).json({ error: 'Falta characterName' });
+    console.log('[verify] Buscando:', name);
+    const char = await getCharacter(name);
+    console.log('[verify] Resultado:', char ? 'encontrado' : 'no encontrado');
+    if (!char) return res.status(404).json({ error: 'Personaje no encontrado en Tibia' });
+    let hasAccount = false;
+    try {
+      const { rows } = await query('SELECT id FROM characters WHERE name_lower=$1', [char.name.toLowerCase()]);
+      hasAccount = rows.length > 0;
+    } catch(dbErr) { console.warn('[verify] DB error:', dbErr.message); }
+    res.json({ character: char, hasAccount });
+  } catch(e) { console.error('[verify] Error:', e.message); res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/auth/register', async (req, res) => {
   try {
     const name = (req.body.characterName || '').trim();
     const char = await getCharacter(name);
@@ -106,7 +120,7 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/api/auth/login', authLimiter, async (req, res) => {
+app.post('/api/auth/login', async (req, res) => {
   try {
     const name = (req.body.characterName || '').trim();
     const { rows } = await query(
@@ -131,19 +145,19 @@ app.get('/api/auth/me', requireAuth, async (req, res) => {
   res.json({ user:req.user, characters:rows, activeCharacter:req.character });
 });
 
-/* ════ RUTAS LISTINGS ════ */
+/* ════ LISTINGS ════ */
 app.get('/api/listings', async (req, res) => {
   try {
     const { server, category, search, page=1, limit=30 } = req.query;
-    const where=[`il.status='active'`,`il.expires_at>NOW()`], params=[];
-    if (server)   { params.push(server);       where.push(`il.server=$${params.length}`); }
-    if (category) { params.push(category);     where.push(`il.item_category=$${params.length}`); }
-    if (search)   { params.push(`%${search}%`);where.push(`il.item_name ILIKE $${params.length}`); }
-    const offset=(Math.max(1,+page)-1)*Math.min(50,+limit), take=Math.min(50,+limit), ws=where.join(' AND ');
+    const where=[`status='active'`,`expires_at>NOW()`], params=[];
+    if (server)   { params.push(server);       where.push(`server=$${params.length}`); }
+    if (category) { params.push(category);     where.push(`item_category=$${params.length}`); }
+    if (search)   { params.push(`%${search}%`);where.push(`item_name ILIKE $${params.length}`); }
+    const offset=(Math.max(1,+page)-1)*Math.min(50,+limit), take=Math.min(50,+limit);
     const { rows } = await query(
-      `SELECT il.*,c.name AS seller_name,c.world AS seller_world,c.vocation AS seller_voc,c.level AS seller_level,u.reputation AS seller_rep
+      `SELECT il.*,c.name AS seller_name,c.world AS seller_world,u.reputation AS seller_rep
        FROM item_listings il JOIN characters c ON c.id=il.character_id JOIN users u ON u.id=c.user_id
-       WHERE ${ws} ORDER BY il.created_at DESC LIMIT ${take} OFFSET ${offset}`, params
+       WHERE ${where.join(' AND ')} ORDER BY il.created_at DESC LIMIT ${take} OFFSET ${offset}`, params
     );
     res.json({ listings:rows });
   } catch(e) { res.status(500).json({ error:e.message }); }
@@ -163,29 +177,29 @@ app.post('/api/listings', requireAuth, async (req, res) => {
 });
 
 app.get('/api/listings/my/active', requireAuth, async (req, res) => {
-  const { rows } = await query(`SELECT id,item_name,item_category,price,server,negotiable,views,status,expires_at FROM item_listings WHERE character_id=$1 ORDER BY created_at DESC`,[req.character.id]);
+  const { rows } = await query(`SELECT id,item_name,item_category,price,server,views,status,expires_at FROM item_listings WHERE character_id=$1 ORDER BY created_at DESC`,[req.character.id]);
   res.json({ listings:rows });
 });
 
 app.delete('/api/listings/:id', requireAuth, async (req, res) => {
-  const { rowCount } = await query(`UPDATE item_listings SET status='deleted',updated_at=NOW() WHERE id=$1 AND character_id=$2`,[req.params.id,req.character.id]);
+  const { rowCount } = await query(`UPDATE item_listings SET status='deleted' WHERE id=$1 AND character_id=$2`,[req.params.id,req.character.id]);
   if (!rowCount) return res.status(404).json({ error:'No encontrado' });
   res.json({ message:'Eliminado' });
 });
 
-/* ════ RUTAS TC ════ */
+/* ════ TC ════ */
 const FX = { MXN:17.2, USD:1, BRL:5.75 };
 app.get('/api/tc', async (req, res) => {
   try {
-    const { server, currency='MXN', page=1, limit=20 } = req.query;
+    const { server, currency='MXN', limit=20 } = req.query;
     const where=[`tl.status='active'`,`tl.expires_at>NOW()`], params=[];
     if (server) { params.push(server); where.push(`tl.server=$${params.length}`); }
-    const rate=FX[currency]||1, take=Math.min(50,+limit), offset=(Math.max(1,+page)-1)*take, ws=where.join(' AND ');
+    const rate=FX[currency]||1, take=Math.min(50,+limit);
     const { rows } = await query(
       `SELECT tl.*,ROUND((tl.price_usd*$${params.length+1})::numeric,4) AS price_local,
        c.name AS seller_name,c.vocation AS seller_voc,c.level AS seller_level,u.reputation AS seller_rep
        FROM tc_listings tl JOIN characters c ON c.id=tl.character_id JOIN users u ON u.id=c.user_id
-       WHERE ${ws} ORDER BY tl.price_usd ASC LIMIT ${take} OFFSET ${offset}`, [...params,rate]
+       WHERE ${where.join(' AND ')} ORDER BY tl.price_usd ASC LIMIT ${take}`, [...params,rate]
     );
     res.json({ listings:rows, currency, rate });
   } catch(e) { res.status(500).json({ error:e.message }); }
@@ -195,16 +209,15 @@ app.post('/api/tc', requireAuth, async (req, res) => {
   try {
     const { amount,priceLocal,currency='MXN',server,minBuy=1,negotiable=false,notes } = req.body;
     if (!amount||!priceLocal||!server) return res.status(400).json({ error:'Faltan campos' });
-    const priceUSD=parseFloat(priceLocal)/(FX[currency]||1);
     const { rows:[l] } = await query(
-      `INSERT INTO tc_listings(character_id,amount,price_usd,currency,price_local,min_buy,server,negotiable,notes) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id,amount,price_usd`,
-      [req.character.id,+amount,priceUSD,currency,+priceLocal,+minBuy,server,negotiable,notes||null]
+      `INSERT INTO tc_listings(character_id,amount,price_usd,currency,price_local,min_buy,server,negotiable,notes) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id,amount`,
+      [req.character.id,+amount,parseFloat(priceLocal)/(FX[currency]||1),currency,+priceLocal,+minBuy,server,negotiable,notes||null]
     );
     res.status(201).json({ message:'¡TC publicado!', listing:l });
   } catch(e) { res.status(500).json({ error:e.message }); }
 });
 
-/* ════ RUTAS MENSAJES ════ */
+/* ════ MENSAJES ════ */
 app.get('/api/messages', requireAuth, async (req, res) => {
   try {
     const { rows } = await query(
@@ -227,17 +240,10 @@ app.post('/api/messages', requireAuth, async (req, res) => {
     const { rows:[recipient] } = await query('SELECT id FROM characters WHERE name_lower=$1',[recipientName.toLowerCase()]);
     if (!recipient) return res.status(404).json({ error:'Destinatario no encontrado' });
     const result = await transaction(async (c) => {
-      const { rows:[ex] } = await c.query(
-        `SELECT id FROM conversations WHERE ((char_a_id=$1 AND char_b_id=$2) OR (char_a_id=$2 AND char_b_id=$1)) LIMIT 1`,
-        [req.character.id,recipient.id]
-      );
-      const cid = ex ? ex.id : (await c.query(
-        `INSERT INTO conversations(char_a_id,char_b_id,item_listing_id) VALUES($1,$2,$3) RETURNING id`,
-        [req.character.id,recipient.id,itemListingId||null]
-      )).rows[0].id;
+      const { rows:[ex] } = await c.query(`SELECT id FROM conversations WHERE ((char_a_id=$1 AND char_b_id=$2) OR (char_a_id=$2 AND char_b_id=$1)) LIMIT 1`,[req.character.id,recipient.id]);
+      const cid = ex ? ex.id : (await c.query(`INSERT INTO conversations(char_a_id,char_b_id,item_listing_id) VALUES($1,$2,$3) RETURNING id`,[req.character.id,recipient.id,itemListingId||null])).rows[0].id;
       const { rows:[msg] } = await c.query('INSERT INTO messages(conversation_id,sender_id,content) VALUES($1,$2,$3) RETURNING id,content,created_at',[cid,req.character.id,content]);
-      const uf = ex?.char_a_id===recipient.id?'unread_a':'unread_b';
-      await c.query(`UPDATE conversations SET last_message=$1,last_message_at=NOW(),${uf}=${uf}+1 WHERE id=$2`,[content.substring(0,100),cid]);
+      await c.query(`UPDATE conversations SET last_message=$1,last_message_at=NOW() WHERE id=$2`,[content.substring(0,100),cid]);
       return { msg, cid };
     });
     res.status(201).json({ message:result.msg, conversationId:result.cid });
@@ -261,29 +267,22 @@ app.post('/api/characters', requireAuth, async (req, res) => {
       `INSERT INTO characters(user_id,name,name_lower,world,vocation,level,guild,is_primary) VALUES($1,$2,$3,$4,$5,$6,$7,FALSE) RETURNING id,name,world,vocation,level`,
       [req.user.id,char.name,char.name.toLowerCase(),char.world,char.vocation,char.level,char.guild]
     );
-    res.status(201).json({ message:`Personaje "${char.name}" agregado`, character:c });
+    res.status(201).json({ message:`Personaje agregado`, character:c });
   } catch(e) { res.status(500).json({ error:e.message }); }
 });
 
-/* ════ HEALTH & ROOT ════ */
-app.get('/',       (req, res) => res.json({ status:'ok' }));
-app.get('/api/test/:name', async (req, res) => {
+/* ════ HEALTH ════ */
+app.get('/api/char/:name', async (req, res) => {
   try {
-    const r = await fetch(`https://api.tibiadata.com/v4/character/${encodeURIComponent(req.params.name)}`);
-    const text = await r.text();
-    res.json({ status: r.status, body: JSON.parse(text) });
-  } catch(e) {
-    res.json({ error: e.message });
-  }
+    const char = await getCharacter(req.params.name);
+    res.json({ found: !!char, character: char });
+  } catch(e) { res.json({ error: e.message }); }
 });
+app.get('/',       (req, res) => res.json({ status:'ok' }));
+app.get('/health', (req, res) => res.json({ status:'ok', service:'Tibia Market API', version:'1.0.0', port:PORT, db:process.env.DATABASE_URL?'configurada':'falta' }));
 
-app.get('/health', (req, res) => res.json({
-  status:'ok', service:'Tibia Market API', version:'1.0.0',
-  port:PORT, db: process.env.DATABASE_URL?'configurada':'falta'
-}));
-
-app.use((req, res) => res.status(404).json({ error:`Ruta no encontrada` }));
-app.use((err, req, res, _n) => { console.error(err.message); res.status(err.status||500).json({ error:err.message }); });
+app.use((req, res) => res.status(404).json({ error:'Ruta no encontrada' }));
+app.use((err, req, res, _n) => { console.error(err.message); res.status(500).json({ error:err.message }); });
 
 app.listen(PORT, '0.0.0.0', () => console.log(`⚔️  Tibia Market API en puerto ${PORT}`));
 module.exports = app;
