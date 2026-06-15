@@ -153,8 +153,8 @@ app.post('/api/listings', requireAuth, async (req, res) => {
     const { itemName,itemCategory,itemType,itemLevel=0,itemAtk,itemDef,itemArm,itemTier=0,itemVocation='Todos',price,negotiable=false,server,description,images=[] } = req.body;
     if (!itemName||!price||!server) return res.status(400).json({ error:'Faltan campos' });
     const { rows:[l] } = await query(
-      `INSERT INTO item_listings(character_id,item_name,item_category,item_type,item_level,item_atk,item_def,item_arm,item_tier,item_vocation,price,negotiable,server,description,images)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id,item_name,price,server`,
+      `INSERT INTO item_listings(character_id,item_name,item_category,item_type,item_level,item_atk,item_def,item_arm,item_tier,item_vocation,price,negotiable,server,description,images,status,expires_at)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'active',NOW()+INTERVAL '30 days') RETURNING id,item_name,price,server`,
       [req.character.id,itemName,itemCategory||'Otros',itemType||'',+itemLevel,itemAtk||null,itemDef||null,itemArm||null,+itemTier,itemVocation,+price,negotiable,server,description||null,images]
     );
     res.status(201).json({ message:'¡Item publicado!', listing:l });
@@ -196,7 +196,7 @@ app.post('/api/tc', requireAuth, async (req, res) => {
     if (!amount||!priceLocal||!server) return res.status(400).json({ error:'Faltan campos' });
     const priceUSD=parseFloat(priceLocal)/(FX[currency]||1);
     const { rows:[l] } = await query(
-      `INSERT INTO tc_listings(character_id,amount,price_usd,currency,price_local,min_buy,server,negotiable,notes) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id,amount,price_usd`,
+      `INSERT INTO tc_listings(character_id,amount,price_usd,currency,price_local,min_buy,server,negotiable,notes,status,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'active',NOW()+INTERVAL '30 days') RETURNING id,amount,price_usd`,
       [req.character.id,+amount,priceUSD,currency,+priceLocal,+minBuy,server,negotiable,notes||null]
     );
     res.status(201).json({ message:'¡TC publicado!', listing:l });
@@ -272,6 +272,39 @@ app.post('/api/characters', requireAuth, async (req, res) => {
   } catch(e) { res.status(500).json({ error:e.message }); }
 });
 
+/* ════ BAZAR DE PERSONAJES ════ */
+app.get('/api/chars', async (req, res) => {
+  try {
+    const { rows } = await query(
+      `SELECT cl.*, c.name AS seller_name, u.reputation AS seller_rep, u.total_trades AS seller_trades
+       FROM char_listings cl JOIN characters c ON c.id=cl.character_id JOIN users u ON u.id=c.user_id
+       WHERE cl.status='active' AND cl.expires_at>NOW() ORDER BY cl.created_at DESC LIMIT 50`
+    );
+    res.json({ listings:rows });
+  } catch(e) { res.status(500).json({ error:e.message }); }
+});
+
+app.post('/api/chars', requireAuth, async (req, res) => {
+  try {
+    const { charName,vocation='Knight',level=0,world,price,bazaarLink,description,skills={},negotiable=false } = req.body;
+    if (!charName||!price||!bazaarLink) return res.status(400).json({ error:'Faltan campos' });
+    const { rows:[l] } = await query(
+      `INSERT INTO char_listings(character_id,char_name,vocation,level,world,price,bazaar_link,description,skills,negotiable,status,expires_at)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,'active',NOW()+INTERVAL '30 days') RETURNING id,char_name,price`,
+      [req.character.id,charName,vocation,+level||0,world||null,+price,bazaarLink,description||null,JSON.stringify(skills||{}),negotiable]
+    );
+    res.status(201).json({ message:'¡Personaje publicado!', listing:l });
+  } catch(e) { res.status(500).json({ error:e.message }); }
+});
+
+app.delete('/api/chars/:id', requireAuth, async (req, res) => {
+  try {
+    const { rowCount } = await query(`UPDATE char_listings SET status='deleted' WHERE id=$1 AND character_id=$2`,[req.params.id,req.character.id]);
+    if (!rowCount) return res.status(404).json({ error:'No encontrado' });
+    res.json({ message:'Eliminado' });
+  } catch(e) { res.status(500).json({ error:e.message }); }
+});
+
 /* ════ HEALTH & ROOT ════ */
 app.get('/',       (req, res) => res.json({ status:'ok' }));
 app.get('/health', (req, res) => res.json({
@@ -282,5 +315,28 @@ app.get('/health', (req, res) => res.json({
 app.use((req, res) => res.status(404).json({ error:`Ruta no encontrada` }));
 app.use((err, req, res, _n) => { console.error(err.message); res.status(err.status||500).json({ error:err.message }); });
 
-app.listen(PORT, '0.0.0.0', () => console.log(`⚔️  Tibia Market API en puerto ${PORT}`));
+async function initDb(){
+  try{
+    await query(`CREATE TABLE IF NOT EXISTS char_listings (
+      id SERIAL PRIMARY KEY,
+      character_id INTEGER NOT NULL,
+      char_name TEXT NOT NULL,
+      vocation TEXT,
+      level INTEGER DEFAULT 0,
+      world TEXT,
+      price BIGINT DEFAULT 0,
+      bazaar_link TEXT,
+      description TEXT,
+      skills JSONB DEFAULT '{}'::jsonb,
+      negotiable BOOLEAN DEFAULT FALSE,
+      status TEXT DEFAULT 'active',
+      views INTEGER DEFAULT 0,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      expires_at TIMESTAMPTZ DEFAULT NOW() + INTERVAL '30 days'
+    )`);
+    console.log('✓ Tabla char_listings lista');
+  }catch(e){ console.error('initDb error:', e.message); }
+}
+
+app.listen(PORT, '0.0.0.0', () => { console.log(`⚔️  Tibia Market API en puerto ${PORT}`); initDb(); });
 module.exports = app;
