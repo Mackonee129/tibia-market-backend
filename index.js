@@ -63,8 +63,15 @@ async function requireAuth(req, res, next) {
 }
 
 /* ── Express setup ── */
-app.use(helmet());
-app.use(cors({ origin: process.env.FRONTEND_URL || '*', credentials: true }));
+app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
+const corsOptions = {
+  origin: true,            // refleja el origen que hace la petición (Netlify, etc.)
+  credentials: true,
+  methods: ['GET','HEAD','POST','PUT','PATCH','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization','Accept'],
+};
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));   // responde el preflight de TODAS las rutas
 app.use(express.json({ limit: '1mb' }));
 app.use(morgan('combined'));
 const limiter     = rateLimit({ windowMs: 15*60*1000, max: 100 });
